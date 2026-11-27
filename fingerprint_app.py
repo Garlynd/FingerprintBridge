@@ -15,6 +15,76 @@ import queue
 from datetime import datetime
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  SOUND — bundled WAV files + SND_FILENAME | SND_ASYNC
+#
+#  Why WAV files instead of SND_ALIAS:
+#    SND_ALIAS depends on the user's Windows sound scheme — if they have
+#    "No Sounds" set, nothing plays. Bundled WAVs always play regardless.
+#
+#  Why SND_ASYNC instead of SND_NOWAIT:
+#    SND_NOWAIT tells Windows "skip if the driver is busy" — that was the
+#    root cause of inconsistent sounds when other audio was playing.
+#    SND_ASYNC tells Windows "start playing and return immediately" —
+#    Windows queues it properly through the audio mixer so it always plays.
+#
+#  The worker thread still exists so the scan loop never blocks waiting for
+#  a previous sound to finish before the next one can be queued.
+# ─────────────────────────────────────────────────────────────────────────────
+import winsound as _winsound
+
+def _sounds_dir() -> str:
+    """
+    When frozen (.exe): WAVs are extracted into _MEIPASS/sounds by PyInstaller.
+    When running as .py: WAVs sit in sounds/ next to the script.
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.join(sys._MEIPASS, "sounds")   # inside the bundle
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "sounds")
+
+_SOUND_FILES = {
+    "in":   "in.wav",
+    "out":  "out.wav",
+    "fail": "fail.wav",
+}
+
+_sound_q: queue.Queue = queue.Queue()
+
+def _sound_worker():
+    while True:
+        event = _sound_q.get()
+        if event is None:
+            break
+        fname = _SOUND_FILES.get(event)
+        if not fname:
+            continue
+        path = os.path.join(_sounds_dir(), fname)
+        try:
+            if os.path.exists(path):
+                # SND_FILENAME: play this exact file
+                # SND_ASYNC: return immediately, let Windows mixer handle it
+                # No SND_NOWAIT — that was dropping sounds when audio was busy
+                _winsound.PlaySound(path,
+                    _winsound.SND_FILENAME | _winsound.SND_ASYNC)
+            else:
+                # WAV missing — fall back to alias so something plays
+                alias = {"in": "SystemAsterisk",
+                         "out": "SystemExclamation",
+                         "fail": "SystemHand"}.get(event)
+                if alias:
+                    _winsound.PlaySound(alias, _winsound.SND_ALIAS | _winsound.SND_ASYNC)
+        except Exception:
+            pass
+
+_sound_thread = threading.Thread(target=_sound_worker,
+                                  name="SoundWorker", daemon=False)
+_sound_thread.start()
+
+def play_sound(event: str) -> None:
+    """Queue a sound. Returns instantly — never blocks the scan loop."""
+    _sound_q.put(event)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  FIX 1 — capture real import errors so the GUI can show them
 # ─────────────────────────────────────────────────────────────────────────────
 _IMPORT_ERRORS: list[str] = []
@@ -323,6 +393,7 @@ class App(tk.Tk):
         self._match_count = 0
         self._fail_count  = 0
         self._theme_name  = "dark"
+        self._colour_registry: list[tuple] = []   # filled by _reg() during _build()
 
         self.title("FingerprintBridge")
         self.geometry("900x640")
@@ -384,81 +455,77 @@ class App(tk.Tk):
                     borderwidth=0, arrowcolor=TEXT3)
 
     def _toggle_theme(self):
-        """Switch between dark and light mode and repaint every widget."""
+        """Switch between dark and light mode — only updates colours, never touches layout."""
         self._theme_name = "light" if self._theme_name == "dark" else "dark"
         _apply_theme(self._theme_name)
         self._styles()
-        self._repaint(self)
-        # update the toggle button label
+        self._apply_colours()
         icon = "☀" if self._theme_name == "light" else "🌙"
-        self._theme_btn.configure(text=f"{icon} {'Light' if self._theme_name=='light' else 'Dark'}")
+        self._theme_btn.configure(
+            text=f"{icon} {'Light' if self._theme_name=='light' else 'Dark'}")
 
-    def _repaint(self, widget):
-        """Walk every widget and update bg/fg to the current theme colours."""
-        cls = widget.__class__.__name__
+    def _reg(self, widget, role: str):
+        """Register a widget so _apply_colours() can repaint it. Call once at build time.
+        role is one of: bg bg2 bg3 card border text text2 text3
+        Special compound roles: card+text  card+text2  card+text3
+        bg2+text  bg2+text2  bg2+text3  bg3+text  canvas  logtext  listbox
+        """
+        self._colour_registry.append((widget, role))
+        return widget   # returns widget so it can be used inline
 
-        # tk widgets — update bg/fg directly
-        if cls in ("Frame", "Label", "Button", "Text", "Listbox", "Canvas"):
+    def _apply_colours(self):
+        """Repaint every registered widget. Never touches layout or geometry."""
+        role_map = {
+            "bg":          lambda w: w.configure(bg=BG),
+            "bg2":         lambda w: w.configure(bg=BG2),
+            "bg3":         lambda w: w.configure(bg=BG3),
+            "card":        lambda w: w.configure(bg=CARD),
+            "card+text":   lambda w: w.configure(bg=CARD, fg=TEXT),
+            "card+text2":  lambda w: w.configure(bg=CARD, fg=TEXT2),
+            "card+text3":  lambda w: w.configure(bg=CARD, fg=TEXT3),
+            "bg+text":     lambda w: w.configure(bg=BG,   fg=TEXT),
+            "bg+text2":    lambda w: w.configure(bg=BG,   fg=TEXT2),
+            "bg+text3":    lambda w: w.configure(bg=BG,   fg=TEXT3),
+            "bg2+text":    lambda w: w.configure(bg=BG2,  fg=TEXT),
+            "bg2+text2":   lambda w: w.configure(bg=BG2,  fg=TEXT2),
+            "bg2+text3":   lambda w: w.configure(bg=BG2,  fg=TEXT3),
+            "bg3+text":    lambda w: w.configure(bg=BG3,  fg=TEXT),
+            # canvas: only bg colour — never triggers a redraw or pack recalc
+            "canvas":      lambda w: w.configure(bg=CARD),
+            "logtext":     lambda w: w.configure(bg=BG2, fg=TEXT2,
+                                                 insertbackground=TEXT),
+            "listbox":     lambda w: w.configure(bg=BG2, fg=TEXT,
+                                                 selectbackground=BG3,
+                                                 selectforeground=GREEN),
+            "topbtn":      lambda w: w.configure(bg=BG2, fg=TEXT2,
+                                                 activebackground=BG2,
+                                                 activeforeground=TEXT),
+            "topbtn+green":lambda w: w.configure(bg=BG2, fg=GREEN,
+                                                 activebackground=BG2,
+                                                 activeforeground=GREEND),
+        }
+        for widget, role in self._colour_registry:
             try:
-                cur_bg = widget.cget("bg")
-                for old, new in [
-                    (THEMES["dark" if self._theme_name=="light" else "light"]["BG"],    BG),
-                    (THEMES["dark" if self._theme_name=="light" else "light"]["BG2"],   BG2),
-                    (THEMES["dark" if self._theme_name=="light" else "light"]["BG3"],   BG3),
-                    (THEMES["dark" if self._theme_name=="light" else "light"]["CARD"],  CARD),
-                    (THEMES["dark" if self._theme_name=="light" else "light"]["BORDER"],BORDER),
-                ]:
-                    if cur_bg == old:
-                        widget.configure(bg=new)
-                        break
+                role_map[role](widget)
             except Exception:
                 pass
-            try:
-                cur_fg = widget.cget("fg")
-                for old, new in [
-                    (THEMES["dark" if self._theme_name=="light" else "light"]["TEXT"],  TEXT),
-                    (THEMES["dark" if self._theme_name=="light" else "light"]["TEXT2"], TEXT2),
-                    (THEMES["dark" if self._theme_name=="light" else "light"]["TEXT3"], TEXT3),
-                ]:
-                    if cur_fg == old:
-                        widget.configure(fg=new)
-                        break
-            except Exception:
-                pass
-            # special: activebackground for buttons in topbar
-            if cls == "Button":
-                try:
-                    ab = widget.cget("activebackground")
-                    old_bg2 = THEMES["dark" if self._theme_name=="light" else "light"]["BG2"]
-                    if ab == old_bg2:
-                        widget.configure(activebackground=BG2)
-                except Exception:
-                    pass
-            # Text and Listbox need insertbackground / selectbackground too
-            if cls == "Text":
-                try:
-                    widget.configure(insertbackground=TEXT)
-                except Exception:
-                    pass
-            if cls == "Listbox":
-                try:
-                    widget.configure(selectbackground=BG3, selectforeground=GREEN)
-                except Exception:
-                    pass
-            # Canvas — redraw fingerprint graphic
-            if cls == "Canvas":
-                try:
-                    widget.configure(bg=CARD)
-                    if self.scan_active:
-                        self._fp_scanning()
-                    else:
-                        self._fp_idle()
-                except Exception:
-                    pass
+        # Canvas bg only — redraw content separately after colours settle
+        try:
+            self._fp_cv.configure(bg=CARD)
+        except Exception:
+            pass
+        # Schedule the canvas content redraw after Tk finishes geometry pass
+        self.after(10, self._redraw_fp)
 
-        # Walk children
-        for child in widget.winfo_children():
-            self._repaint(child)
+    def _redraw_fp(self):
+        """Redraw fingerprint canvas content after colours have settled."""
+        try:
+            if self.scan_active:
+                self._fp_scanning()
+            else:
+                self._fp_idle()
+        except Exception:
+            pass
 
     # ── layout ──────────────────────────────────────────────────────────────
     def _build(self):
@@ -466,11 +533,13 @@ class App(tk.Tk):
         bar = tk.Frame(self, bg=BG2, height=50)
         bar.pack(fill="x")
         bar.pack_propagate(False)
-        tk.Label(bar, text="●", fg=GREEN, bg=BG2, font=(MONO, 13)).pack(side="left", padx=(14,5))
-        tk.Label(bar, text="FingerprintBridge", fg=TEXT, bg=BG2,
-                 font=(SANS, 12, "bold")).pack(side="left")
-        tk.Label(bar, text="AS608 · Supabase", fg=TEXT3, bg=BG2,
-                 font=(MONO, 8)).pack(side="left", padx=(8,0), pady=(3,0))
+        self._reg(bar, "bg2")
+        self._reg(tk.Label(bar, text="●", fg=GREEN, bg=BG2,
+                           font=(MONO, 13)), "bg2").pack(side="left", padx=(14,5))
+        self._reg(tk.Label(bar, text="FingerprintBridge", fg=TEXT, bg=BG2,
+                           font=(SANS, 12, "bold")), "bg2+text").pack(side="left")
+        self._reg(tk.Label(bar, text="AS608 · Supabase", fg=TEXT3, bg=BG2,
+                           font=(MONO, 8)), "bg2+text3").pack(side="left", padx=(8,0), pady=(3,0))
 
         self._conn_btn = tk.Button(bar, text="Connect", fg=GREEN, bg=BG2,
                                    activebackground=BG2, activeforeground=GREEND,
@@ -530,12 +599,14 @@ class App(tk.Tk):
         f = self._t_scan
         f.columnconfigure((0,1), weight=1)
         f.rowconfigure(1, weight=1)
+        self._reg(f, "bg")
 
         # metric row
         mrow = tk.Frame(f, bg=BG)
         mrow.grid(row=0, column=0, columnspan=2, sticky="ew", padx=14, pady=(14,8))
         for i in range(4):
             mrow.columnconfigure(i, weight=1)
+        self._reg(mrow, "bg")
 
         self._m_enrolled = tk.StringVar(value="0")
         self._m_matches  = tk.StringVar(value="0")
@@ -550,25 +621,45 @@ class App(tk.Tk):
         ]):
             c = self._card(mrow)
             c.grid(row=0, column=i, sticky="nsew", padx=(0 if i==0 else 6, 0))
-            tk.Label(c, text=lbl, fg=TEXT3, bg=CARD, font=(MONO,8)).pack(pady=(10,2))
+            self._reg(c, "card")
+            self._reg(tk.Label(c, text=lbl, fg=TEXT3, bg=CARD,
+                               font=(MONO,8)), "card+text3").pack(pady=(10,2))
             ttk.Label(c, textvariable=var, style=sty).pack(pady=(0,10))
 
         # left scanner panel
         left = self._card(f)
         left.grid(row=1, column=0, sticky="nsew", padx=(14,6), pady=(0,14))
         left.columnconfigure(0, weight=1)
+        self._reg(left, "card")
 
-        tk.Label(left, text="SCANNER", fg=TEXT3, bg=CARD, font=(MONO,8)).pack(pady=(14,0))
+        self._reg(tk.Label(left, text="SCANNER", fg=TEXT3, bg=CARD,
+                           font=(MONO,8)), "card+text3").pack(pady=(14,0))
 
-        self._fp_cv = tk.Canvas(left, width=120, height=120, bg=CARD, highlightthickness=0)
-        self._fp_cv.pack(pady=14)
+        # Canvas: wrapped in a fixed-size frame that pack_propagate=False locks
+        # Using grid inside left panel so the canvas row has a fixed minsize
+        left.rowconfigure(1, minsize=148)   # row 1 = canvas row, never shrinks
+
+        cv_wrap = tk.Frame(left, bg=CARD, width=124, height=124)
+        cv_wrap.pack(pady=14)
+        cv_wrap.pack_propagate(False)   # ignore children's size requests
+        self._reg(cv_wrap, "card")
+
+        self._fp_cv = tk.Canvas(cv_wrap, width=120, height=120,
+                                bg=CARD, highlightthickness=0)
+        self._fp_cv.pack(expand=True)
+        # Explicitly set canvas size attributes — these survive delete("all")
+        self._fp_cv.configure(width=120, height=120)
         self._fp_idle()
 
         self._scan_lbl = tk.Label(left, text="Place finger on sensor",
                                   fg=TEXT, bg=CARD, font=(SANS,11,"bold"))
         self._scan_lbl.pack()
-        self._scan_sub = tk.Label(left, text="Not connected", fg=TEXT2, bg=CARD, font=(MONO,9))
+        self._reg(self._scan_lbl, "card+text")
+
+        self._scan_sub = tk.Label(left, text="Not connected",
+                                  fg=TEXT2, bg=CARD, font=(MONO,9))
         self._scan_sub.pack(pady=(3,14))
+        self._reg(self._scan_sub, "card+text2")
 
         self._pbar = ttk.Progressbar(left, mode="indeterminate", length=150,
                                      style="Horizontal.TProgressbar")
@@ -577,6 +668,7 @@ class App(tk.Tk):
         btnf = tk.Frame(left, bg=CARD)
         btnf.pack(fill="x", padx=18, pady=(0,16))
         btnf.columnconfigure((0,1), weight=1)
+        self._reg(btnf, "card")
 
         self._btn_scan = ttk.Button(btnf, text="▶  Start Scan",
                                     style="Green.TButton", command=self._start_scan)
@@ -591,8 +683,10 @@ class App(tk.Tk):
         right.grid(row=1, column=1, sticky="nsew", padx=(0,14), pady=(0,14))
         right.rowconfigure(1, weight=1)
         right.columnconfigure(0, weight=1)
+        self._reg(right, "card")
 
-        tk.Label(right, text="RECENT SCANS", fg=TEXT3, bg=CARD, font=(MONO,8)).pack(pady=(14,6))
+        self._reg(tk.Label(right, text="RECENT SCANS", fg=TEXT3, bg=CARD,
+                           font=(MONO,8)), "card+text3").pack(pady=(14,6))
 
         cols = ("time","user","slot","conf","result")
         self._scan_tv = ttk.Treeview(right, columns=cols, show="headings",
@@ -882,7 +976,9 @@ class App(tk.Tk):
                         highlightthickness=1, highlightbackground=BORDER)
 
     def _fp_idle(self):
-        c = self._fp_cv; c.delete("all")
+        c = self._fp_cv
+        c.delete("all")
+        c.configure(width=120, height=120)   # re-assert after delete("all")
         c.create_oval(10,10,110,110, outline=BORDER, width=2)
         cx,cy = 60,60
         for off in range(-3,4):
@@ -891,7 +987,9 @@ class App(tk.Tk):
                          style="arc", outline=TEXT3, width=1)
 
     def _fp_scanning(self):
-        c = self._fp_cv; c.delete("all")
+        c = self._fp_cv
+        c.delete("all")
+        c.configure(width=120, height=120)
         c.create_oval(10,10,110,110, outline=GREEN, width=2)
         cx,cy = 60,60
         for i,off in enumerate(range(-3,4)):
@@ -901,14 +999,102 @@ class App(tk.Tk):
                          style="arc", outline=col, width=1)
 
     def _fp_match(self):
-        c = self._fp_cv; c.delete("all")
+        c = self._fp_cv
+        c.delete("all")
+        c.configure(width=120, height=120)
         c.create_oval(10,10,110,110, outline=GREEN, width=3)
         c.create_text(60,60, text="✓", fill=GREEN, font=(SANS,32,"bold"))
 
     def _fp_fail(self):
-        c = self._fp_cv; c.delete("all")
+        c = self._fp_cv
+        c.delete("all")
+        c.configure(width=120, height=120)
         c.create_oval(10,10,110,110, outline=RED, width=3)
         c.create_text(60,60, text="✕", fill=RED, font=(SANS,32,"bold"))
+
+    # ── Sound ────────────────────────────────────────────────────────────────
+    def _beep(self, pattern: str):
+        """Play a system sound in a detached subprocess."""
+        play_sound(pattern)
+
+    # ── Canvas blink animation ───────────────────────────────────────────────
+    # Each blink sequence runs on the main thread via after() chains.
+    # _blink_count tracks remaining flashes; _blink_state tracks on/off.
+
+    def _blink_in(self, flashes=4, interval=120):
+        """Green blink for IN — alternates between match icon and dark ring."""
+        self._blink_sequence(
+            on_fn=self._fp_match,
+            off_fn=self._fp_match_dim,
+            flashes=flashes,
+            interval=interval,
+            restore_fn=self._fp_match,
+        )
+
+    def _blink_out(self, flashes=4, interval=120):
+        """Amber blink for OUT."""
+        self._blink_sequence(
+            on_fn=self._fp_out,
+            off_fn=self._fp_out_dim,
+            flashes=flashes,
+            interval=interval,
+            restore_fn=self._fp_out,
+        )
+
+    def _blink_fail(self, flashes=3, interval=100):
+        """Red blink for no match / fail."""
+        self._blink_sequence(
+            on_fn=self._fp_fail,
+            off_fn=self._fp_fail_dim,
+            flashes=flashes,
+            interval=interval,
+            restore_fn=self._fp_fail,
+        )
+
+    def _blink_sequence(self, on_fn, off_fn, flashes, interval, restore_fn):
+        """Generic blink: alternate on/off `flashes` times then settle on restore_fn."""
+        total_steps = flashes * 2
+
+        def _step(n):
+            if n <= 0:
+                restore_fn()
+                return
+            if n % 2 == 0:
+                off_fn()
+            else:
+                on_fn()
+            self.after(interval, lambda: _step(n - 1))
+
+        _step(total_steps)
+
+    # ── Dim variants for blink off-frames ────────────────────────────────────
+    def _fp_match_dim(self):
+        c = self._fp_cv
+        c.delete("all")
+        c.configure(width=120, height=120)
+        c.create_oval(10,10,110,110, outline=GREEND, width=2)
+        c.create_text(60,60, text="✓", fill=GREEND, font=(SANS,32,"bold"))
+
+    def _fp_out(self):
+        c = self._fp_cv
+        c.delete("all")
+        c.configure(width=120, height=120)
+        c.create_oval(10,10,110,110, outline=AMBER, width=3)
+        c.create_text(60,60, text="✓", fill=AMBER, font=(SANS,32,"bold"))
+
+    def _fp_out_dim(self):
+        c = self._fp_cv
+        c.delete("all")
+        c.configure(width=120, height=120)
+        c.create_oval(10,10,110,110, outline="#7A5010", width=2)
+        c.create_text(60,60, text="✓", fill="#7A5010", font=(SANS,32,"bold"))
+
+    def _fp_fail_dim(self):
+        c = self._fp_cv
+        c.delete("all")
+        c.configure(width=120, height=120)
+        c.create_oval(10,10,110,110, outline="#7A1515", width=2)
+        c.create_text(60,60, text="✕", fill="#7A1515", font=(SANS,32,"bold"))
 
     def _log(self, msg: str, tag=""):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -1005,8 +1191,9 @@ class App(tk.Tk):
                 if slot == -1:
                     self._fail_count += 1
                     f = self._fail_count
+                    self._beep("fail")
                     def show_fail(fc=f):
-                        self._fp_fail()
+                        self._blink_fail()
                         self._scan_lbl.configure(text="No match found")
                         self._scan_sub.configure(text="Unknown fingerprint — not in system")
                         self._m_fails.set(str(fc))
@@ -1027,8 +1214,9 @@ class App(tk.Tk):
                     if employee is None:
                         self._fail_count += 1
                         f = self._fail_count
+                        self._beep("fail")
                         def show_no_user(fc=f, s=slot):
-                            self._fp_fail()
+                            self._blink_fail()
                             self._scan_lbl.configure(text="Employee not found")
                             self._scan_sub.configure(text=f"Slot #{s} matched but no user record in database")
                             self._m_fails.set(str(fc))
@@ -1051,6 +1239,9 @@ class App(tk.Tk):
 
                         status = "OUT" if latest == "IN" else "IN"
 
+                        # Queue sound — returns instantly
+                        self._beep(status.lower())
+
                         # Write to personnel_entry_logs
                         try:
                             self.ctrl.log_entry(employee, status)
@@ -1062,7 +1253,11 @@ class App(tk.Tk):
                         m = self._match_count
                         def show_match(n=fullname, r=role, s=slot, cp=cpct,
                                        st=status, mc=m, ok=supabase_ok):
-                            self._fp_match()
+                            # Blink green for IN, amber for OUT
+                            if st == "IN":
+                                self._blink_in()
+                            else:
+                                self._blink_out()
                             status_color = GREEN if st == "IN" else AMBER
                             self._scan_lbl.configure(text=f"{n}  —  {st}", fg=status_color)
                             sb_note = "logged to Supabase" if ok else "⚠ Supabase insert FAILED — check Log tab"
@@ -1339,4 +1534,7 @@ class App(tk.Tk):
 
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    App().mainloop()
+    app = App()
+    app.mainloop()
+    _sound_q.put(None)       # tell worker to stop cleanly
+    _sound_thread.join(timeout=2)
