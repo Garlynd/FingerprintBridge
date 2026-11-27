@@ -13,7 +13,11 @@ a = Analysis(
     ['fingerprint_app.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[
+        # Bundle the sounds folder next to the .exe
+        # Format: (source_path, dest_folder_inside_bundle)
+        ('sounds', 'sounds'),
+    ],
     hiddenimports=[
         # ── pyserial ─────────────────────────────────────────────────────────
         'serial',
@@ -66,6 +70,8 @@ a = Analysis(
         'tkinter',
         'tkinter.ttk',
         'tkinter.messagebox',
+        # ── winsound (stdlib, but explicitly listed for PyInstaller) ─────────
+        'winsound',
     ],
     hookspath=[],
     hooksconfig={},
